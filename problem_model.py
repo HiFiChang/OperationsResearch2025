@@ -5,7 +5,7 @@
 
 import numpy as np
 from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from data_loader import DataLoader
 
 @dataclass
@@ -14,7 +14,7 @@ class DeliveryTask:
     station_id: int
     product_id: int
     quantity: float
-    tank_id: int = None
+    tank_id: Optional[int] = None # 对应的油罐ID
     
 @dataclass
 class Route:
@@ -25,7 +25,9 @@ class Route:
     end_depot: int
     tasks: List[DeliveryTask]
     start_time: float = 8.0  # 开始时间（小时）
-    
+    is_feasible: bool = True
+    violations: List[str] = field(default_factory=list)
+
 @dataclass
 class Solution:
     """解决方案"""
@@ -35,80 +37,16 @@ class Solution:
     violations: List[str] = None
 
 class ProblemModel:
-    """问题建模类"""
+    """
+    问题建模与评估器.
+    该类现在主要作为辅助类，提供成本计算和约束检查功能。
+    """
     
     def __init__(self, data_loader: DataLoader):
         self.data = data_loader
         self.working_hours = 9.0  # 8:00-17:00
         self.max_trips_per_vehicle = 2
         
-        # 计算时间窗口
-        self._calculate_time_windows()
-        
-    def _calculate_time_windows(self):
-        """计算每个加油站每种油品的时间窗口"""
-        self.time_windows = {}
-
-        for station_id in self.data.stations:
-            self.time_windows[station_id] = {}
-
-            for product_id in self.data.products:
-                if station_id in self.data.demands and product_id in self.data.demands[station_id]:
-                    # 获取需求量和当前库存
-                    daily_demand = self.data.get_expected_demand(station_id, product_id)
-                    current_inventory = self.data.station_inventory.get(station_id, {}).get(product_id, {}).get('total_inventory', 0)
-                    total_capacity = self.data.station_inventory.get(station_id, {}).get(product_id, {}).get('total_capacity', 0)
-
-                    if daily_demand > 0:
-                        # 计算消耗速率（升/小时）
-                        consumption_rate = daily_demand / 24.0
-                        
-                        # 计算断油时间点（库存量归零的时间）
-                        if current_inventory > 0 and consumption_rate > 0:
-                            stockout_time = min(current_inventory / consumption_rate, self.working_hours)
-                        else:
-                            stockout_time = 0.0  # 立即断油
-                        
-                        # 计算不容纳时间点（油罐容量限制无法继续接收的时间）
-                        available_capacity = total_capacity - current_inventory
-                        if available_capacity > 0 and consumption_rate > 0:
-                            # 当前库存继续消耗，什么时候能腾出足够空间接收配送
-                            no_accept_time = max(0, (current_inventory + daily_demand - total_capacity) / consumption_rate)
-                        else:
-                            no_accept_time = self.working_hours  # 无法接收
-                        
-                        # 配送时间窗口：不能早于不容纳时间点，不能晚于断油时间点
-                        earliest_time = max(0, no_accept_time)
-                        latest_time = min(stockout_time, self.working_hours)
-                        
-                        # 如果时间窗口不合理，调整为宽松窗口
-                        if earliest_time >= latest_time:
-                            earliest_time = 0.0
-                            latest_time = self.working_hours
-
-                        self.time_windows[station_id][product_id] = {
-                            'earliest': earliest_time,
-                            'latest': latest_time,
-                            'stockout_time': stockout_time,
-                            'no_accept_time': no_accept_time
-                        }
-                    else:
-                        # 没有需求的情况
-                        self.time_windows[station_id][product_id] = {
-                            'earliest': 0,
-                            'latest': self.working_hours,
-                            'stockout_time': float('inf'),
-                            'no_accept_time': 0
-                        }
-                else:
-                    # 没有需求数据的情况
-                    self.time_windows[station_id][product_id] = {
-                        'earliest': 0,
-                        'latest': self.working_hours,
-                        'stockout_time': float('inf'),
-                        'no_accept_time': 0
-                    }
-                        
     def calculate_route_cost(self, route: Route) -> float:
         """计算路径成本"""
         if not route.tasks:
@@ -213,8 +151,11 @@ class ProblemModel:
 
         return True, ""
             
-    def check_time_constraint(self, route: Route) -> Tuple[bool, str]:
-        """检查时间约束"""
+    def check_time_constraint(self, route: Route, time_windows: Dict, existing_schedules: Dict = None) -> Tuple[bool, str]:
+        """
+        检查时间约束 (现在从外部接收时间窗)
+        新增: 接收一个可选的、已存在的站点日程表，以检查同时服务冲突
+        """
         route_time = self.calculate_route_time(route)
         
         if route_time > self.working_hours:
@@ -228,25 +169,43 @@ class ProblemModel:
         
         visited_stations = []
         for task in route.tasks:
+            # 使用任务中携带的时间窗信息
+            task_key = (task.station_id, task.product_id, task.tank_id)
+            if task_key not in time_windows:
+                 return False, f"任务 {task_key} 没有找到对应的时间窗信息"
+
+            tw = time_windows[task_key]
+            earliest = tw['earliest']
+            latest = tw['latest']
+
             if task.station_id not in visited_stations:
                 # 到达时间
                 distance = self.data.get_distance(current_location, task.station_id)
                 travel_time = distance / speed
                 arrival_time = current_time + travel_time
                 
-                # 检查时间窗口
-                time_window = self.time_windows.get(task.station_id, {}).get(task.product_id, {})
-                earliest = time_window.get('earliest', 0)
-                latest = time_window.get('latest', self.working_hours)
-                
                 if arrival_time < earliest:
-                    return False, f"到达加油站{task.station_id}时间{arrival_time:.2f}早于最早时间{earliest:.2f}"
-                if arrival_time > latest:
-                    return False, f"到达加油站{task.station_id}时间{arrival_time:.2f}晚于最晚时间{latest:.2f}"
+                    # 允许等待
+                    current_time = earliest
+                else:
+                    current_time = arrival_time
+                    
+                if current_time > latest:
+                    return False, f"到达加油站{task.station_id}时间{current_time:.2f}晚于最晚时间{latest:.2f}"
                 
-                # 更新当前时间和位置
+                # 计算并检查与现有日程的冲突
                 unload_time = self.data.stations[task.station_id]['unload_time']
-                current_time = arrival_time + unload_time
+                service_start_time = current_time
+                service_end_time = service_start_time + unload_time
+
+                if existing_schedules and task.station_id in existing_schedules:
+                    for start, end, v_id, trip in existing_schedules[task.station_id]:
+                        # 检查新时段 [service_start_time, service_end_time] 是否与 [start, end] 重叠
+                        if max(service_start_time, start) < min(service_end_time, end):
+                            return False, f"与车辆{v_id}(趟次{trip})在加油站{task.station_id}发生时间冲突"
+
+                # 更新当前时间和位置
+                current_time = service_end_time
                 current_location = task.station_id
                 visited_stations.append(task.station_id)
                 
@@ -336,8 +295,58 @@ class ProblemModel:
         
         return True, ""
         
-    def evaluate_solution(self, solution: Solution) -> Solution:
-        """评估解决方案"""
+    def check_demand_range_constraint(self, solution: Solution, time_windows: Dict) -> Tuple[bool, str]:
+        """
+        检查配送量是否在合理的需求区间内
+        """
+        violations = []
+        
+        for route in solution.routes:
+            for task in route.tasks:
+                task_key = (task.station_id, task.product_id, task.tank_id)
+                
+                if task_key in time_windows:
+                    tw_info = time_windows[task_key]
+                    min_qty = tw_info.get('min_quantity', 0)
+                    max_qty = tw_info.get('max_quantity', float('inf'))
+                    
+                    if task.quantity < min_qty:
+                        violations.append(
+                            f"任务{task_key}配送量{task.quantity:.0f}升低于最小需求{min_qty:.0f}升"
+                        )
+                    elif task.quantity > max_qty:
+                        violations.append(
+                            f"任务{task_key}配送量{task.quantity:.0f}升超过最大需求{max_qty:.0f}升"
+                        )
+        
+        if violations:
+            return False, "; ".join(violations)
+        return True, ""
+        
+    def check_route_depot_constraint(self, solution: Solution) -> Tuple[bool, str]:
+        """
+        检查配送车最终返回油库A的约束
+        根据实验要求：配送车一天的配送完成后最终返回油库A
+        """
+        for route in solution.routes:
+            # 检查每辆车的最后一趟是否返回油库A
+            vehicle_routes = [r for r in solution.routes if r.vehicle_id == route.vehicle_id]
+            if not vehicle_routes:
+                continue
+                
+            # 找到该车辆的最后一趟配送
+            last_trip = max(vehicle_routes, key=lambda r: r.trip_number)
+            if last_trip.end_depot != 8001:  # 8001是油库A的编码
+                return False, f"车辆{route.vehicle_id}的最后一趟配送未返回油库A（当前终点：{last_trip.end_depot}）"
+                
+        return True, ""
+        
+    def evaluate_solution(self, solution: Solution, time_windows: Dict, total_tasks_generated: int) -> Solution:
+        """
+        评估解决方案 (v2.0)
+        - 新增: 检查所有任务是否都被服务
+        - 移除冗余的同时服务检查
+        """
         total_cost = 0.0
         violations = []
         is_feasible = True
@@ -354,20 +363,38 @@ class ProblemModel:
                 is_feasible = False
                 violations.append(f"路径{route.vehicle_id}-{route.trip_number}: {msg}")
                 
-            # 时间约束
-            feasible, msg = self.check_time_constraint(route)
+            # 时间约束 (注意：这里的检查是事后验证，不包含动态的冲突规避)
+            feasible, msg = self.check_time_constraint(route, time_windows)
             if not feasible:
                 is_feasible = False
                 violations.append(f"路径{route.vehicle_id}-{route.trip_number}: {msg}")
                 
-        # 库存约束
+        # 1. 检查所有任务是否都已分配
+        num_tasks_in_solution = sum(len(r.tasks) for r in solution.routes)
+        if num_tasks_in_solution < total_tasks_generated:
+            is_feasible = False
+            violations.append(f"任务未全部完成: {num_tasks_in_solution}/{total_tasks_generated}")
+
+        # 2. 库存约束
         feasible, msg = self.check_inventory_constraint(solution)
         if not feasible:
             is_feasible = False
             violations.append(msg)
             
-        # 同时配送约束
+        # 3. 同时配送约束 (使用最终方案重新检查)
         feasible, msg = self.check_simultaneous_delivery_constraint(solution)
+        if not feasible:
+            is_feasible = False
+            violations.append(msg)
+            
+        # 4. 需求量区间约束
+        feasible, msg = self.check_demand_range_constraint(solution, time_windows)
+        if not feasible:
+            is_feasible = False
+            violations.append(msg)
+            
+        # 5. 最终返回油库A的约束
+        feasible, msg = self.check_route_depot_constraint(solution)
         if not feasible:
             is_feasible = False
             violations.append(msg)
@@ -381,72 +408,3 @@ class ProblemModel:
     def create_empty_solution(self) -> Solution:
         """创建空解决方案"""
         return Solution(routes=[], violations=[])
-        
-    def get_all_delivery_requirements(self) -> List[DeliveryTask]:
-        """获取所有配送需求"""
-        tasks = []
-        for station_id, station_demands in self.data.demands.items():
-            for product_id, demand_info in station_demands.items():
-                quantity = demand_info['most_likely']
-                if quantity > 0:
-                    # 为每种油品的需求分配到具体的油罐
-                    allocated_tasks = self._allocate_demand_to_tanks(station_id, product_id, quantity)
-                    tasks.extend(allocated_tasks)
-        return tasks
-    
-    def _allocate_demand_to_tanks(self, station_id: int, product_id: int, total_quantity: float) -> List[DeliveryTask]:
-        """将需求量分配到具体的油罐"""
-        tasks = []
-        
-        # 获取该加油站该油品的所有油罐
-        tank_info = self.data.station_inventory.get(station_id, {}).get(product_id, {}).get('tanks', {})
-        
-        if not tank_info:
-            # 如果没有油罐信息，创建一个默认任务
-            tasks.append(DeliveryTask(
-                station_id=station_id,
-                product_id=product_id,
-                quantity=total_quantity,
-                tank_id=None
-            ))
-            return tasks
-        
-        # 按油罐可接收容量排序（优先给空余容量大的油罐配送）
-        sorted_tanks = []
-        for tank_id, tank_data in tank_info.items():
-            capacity = tank_data['capacity']
-            inventory = tank_data['inventory']
-            available_capacity = capacity - inventory
-            sorted_tanks.append((tank_id, available_capacity, capacity))
-        
-        # 按可接收容量降序排序
-        sorted_tanks.sort(key=lambda x: x[1], reverse=True)
-        
-        remaining_quantity = total_quantity
-        
-        for tank_id, available_capacity, tank_capacity in sorted_tanks:
-            if remaining_quantity <= 0:
-                break
-                
-            # 该油罐能接收的最大配送量
-            deliverable = min(remaining_quantity, available_capacity)
-            
-            if deliverable > 0:
-                tasks.append(DeliveryTask(
-                    station_id=station_id,
-                    product_id=product_id,
-                    quantity=deliverable,
-                    tank_id=tank_id
-                ))
-                remaining_quantity -= deliverable
-        
-        # 如果还有剩余需求无法分配，创建一个任务记录
-        if remaining_quantity > 0:
-            tasks.append(DeliveryTask(
-                station_id=station_id,
-                product_id=product_id,
-                quantity=remaining_quantity,
-                tank_id=None  # 表示无法分配到具体油罐
-            ))
-        
-        return tasks

@@ -21,8 +21,8 @@ class ResultAnalyzer:
         self.model = problem_model
         self.data = data_loader
         
-    def analyze_solution(self, solution: Solution):
-        """分析解决方案"""
+    def analyze_solution(self, solution: Solution, time_windows: Dict = None):
+        """分析解决方案（增加区间分析）"""
         print("\n" + "=" * 50)
         print("解决方案分析")
         print("=" * 50)
@@ -49,6 +49,9 @@ class ResultAnalyzer:
         
         # 时间分析
         self._analyze_time_usage(solution)
+        
+        # 需求量区间使用分析
+        self._analyze_demand_range_utilization(solution, time_windows)
         
     def _analyze_vehicle_usage(self, solution: Solution):
         """分析车辆使用情况"""
@@ -197,6 +200,55 @@ class ResultAnalyzer:
         else:
             print(f"  时间约束: 违反（超出{max_time - self.model.working_hours:.2f}小时）")
             
+    def _analyze_demand_range_utilization(self, solution: Solution, time_windows: Dict = None):
+        """分析需求量区间的使用情况"""
+        print(f"\n需求量区间使用分析:")
+        
+        if not time_windows:
+            print("  无时间窗信息，跳过区间分析")
+            return
+            
+        total_tasks = 0
+        within_preferred = 0
+        below_preferred = 0
+        above_preferred = 0
+        utilization_ratios = []
+        
+        for route in solution.routes:
+            for task in route.tasks:
+                task_key = (task.station_id, task.product_id, task.tank_id)
+                
+                if task_key in time_windows:
+                    tw_info = time_windows[task_key]
+                    min_qty = tw_info.get('min_quantity', task.quantity)
+                    max_qty = tw_info.get('max_quantity', task.quantity)
+                    preferred_qty = tw_info.get('preferred_quantity', task.quantity)
+                    
+                    total_tasks += 1
+                    
+                    # 统计相对于偏好量的分布
+                    if task.quantity == preferred_qty:
+                        within_preferred += 1
+                    elif task.quantity < preferred_qty:
+                        below_preferred += 1
+                    else:
+                        above_preferred += 1
+                    
+                    # 计算区间利用率
+                    if max_qty > min_qty:
+                        utilization = (task.quantity - min_qty) / (max_qty - min_qty)
+                        utilization_ratios.append(utilization)
+        
+        if total_tasks > 0:
+            print(f"  任务总数: {total_tasks}")
+            print(f"  按偏好量配送: {within_preferred} ({within_preferred/total_tasks:.1%})")
+            print(f"  低于偏好量: {below_preferred} ({below_preferred/total_tasks:.1%})")
+            print(f"  高于偏好量: {above_preferred} ({above_preferred/total_tasks:.1%})")
+            
+            if utilization_ratios:
+                print(f"  平均区间利用率: {np.mean(utilization_ratios):.2f}")
+                print(f"  区间利用率标准差: {np.std(utilization_ratios):.2f}")
+        
     def save_results(self, solution: Solution, filename: str):
         """保存结果到JSON文件"""
         results = {

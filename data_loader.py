@@ -80,7 +80,8 @@ class DataLoader:
                 'compartment2_capacity': row['车仓2（升）'],
                 'total_capacity': row['车仓1（升）'] + row['车仓2（升）'],
                 'speed': row['车速（km/hr）'],
-                'cost_per_km': row['单位距离运输成本']
+                'cost_per_km': row['单位距离运输成本'],
+                'depot_id': 8001  # 根据README，所有车辆都属于油库A
             }
         print(f"加载了 {len(self.vehicles)} 辆油罐车")
         
